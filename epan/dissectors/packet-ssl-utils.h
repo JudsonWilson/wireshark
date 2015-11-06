@@ -240,6 +240,7 @@ typedef struct _StringInfo {
 #define SSL_VERSION             (1<<4)
 #define SSL_MASTER_SECRET       (1<<5)
 #define SSL_PRE_MASTER_SECRET   (1<<6)
+#define SSL_HAVE_KEY_BLOCK_NEW  (1<<7)
 
 /* SSL Cipher Suite modes */
 typedef enum {
@@ -370,6 +371,7 @@ typedef struct _SslDecryptSession {
     SslDecoder *client;
     SslDecoder *server_new;
     SslDecoder *client_new;
+    StringInfo key_block_new;
     SSL_PRIVATE_KEY* private_key;
     StringInfo psk;
     guint16 version_netorder;
