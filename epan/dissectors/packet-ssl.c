@@ -2728,7 +2728,7 @@ dissect_ssl2_hnd_client_hello(tvbuff_t *tvb, packet_info *pinfo,
             tvb_memcpy(tvb,ssl->session_id.data, offset, session_id_length);
             ssl->session_id.data_len = session_id_length;
             ssl->state &= ~(SSL_HAVE_SESSION_KEY|SSL_MASTER_SECRET|SSL_PRE_MASTER_SECRET|
-                    SSL_CIPHER|SSL_SERVER_RANDOM);
+                    SSL_HAVE_KEY_BLOCK_NEW|SSL_CIPHER|SSL_SERVER_RANDOM);
         }
         offset += session_id_length;
     }

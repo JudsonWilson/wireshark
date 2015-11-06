@@ -256,6 +256,7 @@ typedef struct _StringInfo {
 #define SSL_CLIENT_EXTENDED_MASTER_SECRET (1<<7)
 #define SSL_SERVER_EXTENDED_MASTER_SECRET (1<<8)
 #define SSL_NEW_SESSION_TICKET  (1<<10)
+#define SSL_HAVE_KEY_BLOCK_NEW  (1<<11)
 
 #define SSL_EXTENDED_MASTER_SECRET_MASK (SSL_CLIENT_EXTENDED_MASTER_SECRET|SSL_SERVER_EXTENDED_MASTER_SECRET)
 
@@ -416,6 +417,7 @@ typedef struct _SslDecryptSession {
     SslDecoder *client;
     SslDecoder *server_new;
     SslDecoder *client_new;
+    StringInfo key_block_new;
 #if defined(HAVE_LIBGNUTLS) && defined(HAVE_LIBGCRYPT)
     gcry_sexp_t private_key;
 #endif
@@ -439,7 +441,7 @@ typedef struct ssl_common_options {
     const gchar        *keylog_filename;
 } ssl_common_options_t;
 
-/** Map from something to a (pre-)master secret */
+/** Map from something to a (pre-)master secret or keyblock */
 typedef struct {
     GHashTable *session;    /* Session ID (1-32 bytes) to master secret. */
     GHashTable *tickets;    /* Session Ticket to master secret. */
@@ -447,6 +449,7 @@ typedef struct {
     GHashTable *pre_master; /* First 8 bytes of encrypted pre-master secret to
                                pre-master secret */
     GHashTable *pms;        /* Client Random to unencrypted pre-master secret */
+    GHashTable *keyblock;   /* Client Random to keyblock */
 } ssl_master_key_map_t;
 
 gint ssl_get_keyex_alg(gint cipher);

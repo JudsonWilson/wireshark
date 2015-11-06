@@ -2981,7 +2981,7 @@ ssl_generate_pre_master_secret(SslDecryptSession *ssl_session,
         /* Remove the master secret if it was there.
            This forces keying material regeneration in
            case we're renegotiating */
-        ssl_session->state &= ~(SSL_MASTER_SECRET|SSL_HAVE_SESSION_KEY);
+        ssl_session->state &= ~(SSL_MASTER_SECRET|SSL_HAVE_KEY_BLOCK_NEW|SSL_HAVE_SESSION_KEY);
         ssl_session->state |= SSL_PRE_MASTER_SECRET;
         return TRUE;
     }
@@ -3062,11 +3062,13 @@ ssl_generate_keyring_material(SslDecryptSession*ssl_session)
 
     /* check for enough info to proced */
     guint need_all = SSL_CIPHER|SSL_CLIENT_RANDOM|SSL_SERVER_RANDOM|SSL_VERSION;
-    guint need_any = SSL_MASTER_SECRET | SSL_PRE_MASTER_SECRET;
+    guint need_any = SSL_MASTER_SECRET | SSL_PRE_MASTER_SECRET | SSL_HAVE_KEY_BLOCK_NEW;
     if (((ssl_session->state & need_all) != need_all) || ((ssl_session->state & need_any) == 0)) {
         ssl_debug_printf("ssl_generate_keyring_material not enough data to generate key "
-                         "(0x%02X required 0x%02X or 0x%02X)\n", ssl_session->state,
-                         need_all|SSL_MASTER_SECRET, need_all|SSL_PRE_MASTER_SECRET);
+                         "(0x%02X required 0x%02X or 0x%02X or 0x%02X)\n",
+                         ssl_session->state,
+                         need_all|SSL_MASTER_SECRET, need_all|SSL_PRE_MASTER_SECRET,
+                         need_all|SSL_HAVE_KEY_BLOCK_NEW);
         /* Special case: for NULL encryption, allow dissection of data even if
          * the Client Hello is missing (MAC keys are now skipped though). */
         need_all = SSL_CIPHER|SSL_VERSION;
@@ -3081,7 +3083,8 @@ ssl_generate_keyring_material(SslDecryptSession*ssl_session)
     }
 
     /* if master key is not available, generate is from the pre-master secret */
-    if (!(ssl_session->state & SSL_MASTER_SECRET)) {
+    if (!(ssl_session->state & SSL_MASTER_SECRET) &&
+        !(ssl_session->state & SSL_HAVE_KEY_BLOCK_NEW)) {
         if ((ssl_session->state & SSL_EXTENDED_MASTER_SECRET_MASK) == SSL_EXTENDED_MASTER_SECRET_MASK) {
             StringInfo handshake_hashed_data;
             gint ret;
@@ -3180,13 +3183,19 @@ ssl_generate_keyring_material(SslDecryptSession*ssl_session)
     needed += 2 * encr_key_len;                             /* encryption key */
     needed += 2 * write_iv_len;                             /* write IV */
 
-    key_block.data = (guchar *)g_malloc(needed);
-    ssl_debug_printf("%s sess key generation\n", G_STRFUNC);
-    if (!prf(ssl_session, &ssl_session->master_secret, "key expansion",
-            &ssl_session->server_random,&ssl_session->client_random,
-            &key_block, needed)) {
-        ssl_debug_printf("%s can't generate key_block\n", G_STRFUNC);
-        goto fail;
+    if (ssl_session->state & SSL_HAVE_KEY_BLOCK_NEW) {
+        key_block = ssl_session->key_block_new;
+        ssl_debug_printf("using loaded key_block\n");
+    }
+    else {
+        key_block.data = (guchar *)g_malloc(needed);
+        ssl_debug_printf("%s sess key generation\n", G_STRFUNC);
+        if (!prf(ssl_session, &ssl_session->master_secret, "key expansion",
+                &ssl_session->server_random,&ssl_session->client_random,
+                &key_block, needed)) {
+            ssl_debug_printf("%s can't generate key_block\n", G_STRFUNC);
+            goto fail;
+        }
     }
     ssl_print_string("key expansion", &key_block);
 
@@ -3347,12 +3356,28 @@ create_decoders:
 
     ssl_debug_printf("%s: client seq %d, server seq %d\n",
         G_STRFUNC, ssl_session->client_new->seq, ssl_session->server_new->seq);
-    g_free(key_block.data);
+
+// XXX I don't know how to free this memory if its the
+// ssl_session->key_block_new, and it's probably allocated incorrectly anyways.
+//    g_free(key_block.data);
+    if (ssl_session->state & SSL_HAVE_KEY_BLOCK_NEW) {
+        ssl_session->key_block_new.data = NULL;
+        ssl_session->key_block_new.data_len = 0;
+        ssl_session->state &= ~SSL_HAVE_KEY_BLOCK_NEW;
+    }
+
     ssl_session->state |= SSL_HAVE_SESSION_KEY;
     return 0;
 
 fail:
-    g_free(key_block.data);
+// XXX I don't know how to free this memory if its the
+// ssl_session->key_block_new, and it's probably allocated incorrectly anyways.
+//    g_free(key_block.data);
+    if (ssl_session->state & SSL_HAVE_KEY_BLOCK_NEW) {
+        ssl_session->key_block_new.data = NULL;
+        ssl_session->key_block_new.data_len = 0;
+        ssl_session->state &= ~SSL_HAVE_KEY_BLOCK_NEW;
+    }
     return -1;
 }
 /* (Pre-)master secrets calculations }}} */
@@ -3402,7 +3427,7 @@ ssl_decrypt_pre_master_secret(SslDecryptSession*ssl_session,
     /* Remove the master secret if it was there.
        This forces keying material regeneration in
        case we're renegotiating */
-    ssl_session->state &= ~(SSL_MASTER_SECRET|SSL_HAVE_SESSION_KEY);
+    ssl_session->state &= ~(SSL_MASTER_SECRET|SSL_HAVE_KEY_BLOCK_NEW|SSL_HAVE_SESSION_KEY);
     ssl_session->state |= SSL_PRE_MASTER_SECRET;
     return TRUE;
 } /* }}} */
@@ -4577,6 +4602,7 @@ ssl_common_init(ssl_master_key_map_t *mk_map,
     mk_map->crandom = g_hash_table_new(ssl_hash, ssl_equal);
     mk_map->pre_master = g_hash_table_new(ssl_hash, ssl_equal);
     mk_map->pms = g_hash_table_new(ssl_hash, ssl_equal);
+    mk_map->keyblock = g_hash_table_new(ssl_hash, ssl_equal);
     ssl_data_alloc(decrypted_data, 32);
     ssl_data_alloc(compressed_data, 32);
 }
@@ -4744,8 +4770,21 @@ ssl_restore_master_key(SslDecryptSession *ssl, const char *label,
     /* (pre)master secret found, clear knowledge of other keys and set it in the
      * current conversation */
     ssl->state &= ~(SSL_MASTER_SECRET | SSL_PRE_MASTER_SECRET |
-                    SSL_HAVE_SESSION_KEY);
-    if (is_pre_master) {
+                    SSL_HAVE_SESSION_KEY | SSL_HAVE_KEY_BLOCK_NEW);
+    if (is_pre_master == 3) { // XXX HACK! Sentinal for keyblock
+        /* Size of key block depends on cipher. */
+        ssl->key_block_new.data = (guchar *) wmem_alloc(wmem_file_scope(),
+                                                            ms->data_len);
+        ssl_data_set(&ssl->key_block_new, ms->data, ms->data_len);
+        ssl->state |= SSL_HAVE_KEY_BLOCK_NEW;
+
+        ssl_debug_printf("%s keyblock retrieved using %s\n", G_STRFUNC,
+                         label);
+        ssl_print_string(label, key);
+        ssl_print_string("keyblock", ms);
+        return TRUE;
+    }
+    else if (is_pre_master) {
         /* unlike master secret, pre-master secret has a variable size (48 for
          * RSA, varying for PSK) and is therefore not statically allocated */
         ssl->pre_master_secret.data = (guchar *) wmem_alloc(wmem_file_scope(),
@@ -4789,7 +4828,9 @@ ssl_finalize_decryption(SslDecryptSession *ssl, ssl_master_key_map_t *mk_map)
          !ssl_restore_master_key(ssl, "Session Ticket", FALSE,
                                  mk_map->tickets, &ssl->session_ticket)) &&
         !ssl_restore_master_key(ssl, "Client Random", FALSE,
-                                mk_map->crandom, &ssl->client_random)) {
+                                mk_map->crandom, &ssl->client_random) &&
+        !ssl_restore_master_key(ssl, "Client Random Keyblock", 3,
+                                mk_map->keyblock, &ssl->client_random)) {
         if (ssl->cipher_suite->enc != ENC_NULL) {
             /* how unfortunate, the master secret could not be found */
             ssl_debug_printf("  Cannot find master secret\n");
@@ -4839,7 +4880,12 @@ ssl_compile_keyfile_regex(void)
         /* Matches Client Hellos having this Client Random */
         "|CLIENT_RANDOM (?<client_random>" OCTET "{32}) "
         /* Master-Secret is given, its length is fixed */
-        ")(?<master_secret>" OCTET "{" G_STRINGIFY(SSL_MASTER_SECRET_LENGTH) "})";
+        ")(?<master_secret>" OCTET "{" G_STRINGIFY(SSL_MASTER_SECRET_LENGTH) "})"
+        /* Key-block with client random. */
+        "|(?:"
+        "CLIENT_RANDOM:KEY_BLOCK (?<client_random_kb>" OCTET "{32})"
+        " (?<keyblock_hex>" OCTET "+)"
+        ")";
 #undef OCTET
     static GRegex *regex = NULL;
     GError *gerr = NULL;
@@ -4895,6 +4941,7 @@ ssl_load_keyfile(const gchar *ssl_keylog_filename, FILE **keylog_file,
         { "session_id",     mk_map->session },
         { "client_random",  mk_map->crandom },
         { "client_random_pms",  mk_map->pms},
+        { "client_random_kb",  mk_map->keyblock},
     };
     /* no need to try if no key log file is configured. */
     if (!ssl_keylog_filename || !*ssl_keylog_filename) {
@@ -4972,26 +5019,33 @@ ssl_load_keyfile(const gchar *ssl_keylog_filename, FILE **keylog_file,
 
         ssl_debug_printf("  checking keylog line: %s\n", line);
         if (g_regex_match(regex, line, G_REGEX_MATCH_ANCHORED, &mi)) {
-            gchar *hex_key, *hex_pre_ms_or_ms;
+            gchar *hex_key, *hex_pre_ms_or_ms_or_keyblock;
             StringInfo *key = wmem_new(wmem_file_scope(), StringInfo);
-            StringInfo *pre_ms_or_ms = NULL;
+            StringInfo *pre_ms_or_ms_or_keyblock = NULL;
             GHashTable *ht = NULL;
 
             /* Is the PMS being supplied with the PMS_CLIENT_RANDOM
              * otherwise we will use the Master Secret
              */
-            hex_pre_ms_or_ms = g_match_info_fetch_named(mi, "master_secret");
-            if (hex_pre_ms_or_ms == NULL || strlen(hex_pre_ms_or_ms) == 0){
-                g_free(hex_pre_ms_or_ms);
-                hex_pre_ms_or_ms = g_match_info_fetch_named(mi, "pms");
+            hex_pre_ms_or_ms_or_keyblock = g_match_info_fetch_named(mi, "master_secret");
+            if (hex_pre_ms_or_ms_or_keyblock == NULL || strlen(hex_pre_ms_or_ms_or_keyblock) == 0){
+                g_free(hex_pre_ms_or_ms_or_keyblock);
+                hex_pre_ms_or_ms_or_keyblock = g_match_info_fetch_named(mi, "pms");
+                if (hex_pre_ms_or_ms_or_keyblock == NULL || strlen(hex_pre_ms_or_ms_or_keyblock) == 0){
+                  g_free(hex_pre_ms_or_ms_or_keyblock);
+                  hex_pre_ms_or_ms_or_keyblock = g_match_info_fetch_named(mi, "keyblock_hex");
+                }
             }
             /* There is always a match, otherwise the regex is wrong. */
-            DISSECTOR_ASSERT(hex_pre_ms_or_ms && strlen(hex_pre_ms_or_ms));
+            DISSECTOR_ASSERT(hex_pre_ms_or_ms_or_keyblock && strlen(hex_pre_ms_or_ms_or_keyblock));
 
             /* convert from hex to bytes and save to hashtable */
-            pre_ms_or_ms = wmem_new(wmem_file_scope(), StringInfo);
-            from_hex(pre_ms_or_ms, hex_pre_ms_or_ms, strlen(hex_pre_ms_or_ms));
-            g_free(hex_pre_ms_or_ms);
+            pre_ms_or_ms_or_keyblock = wmem_new(wmem_file_scope(), StringInfo);
+            from_hex(pre_ms_or_ms_or_keyblock, hex_pre_ms_or_ms_or_keyblock, strlen(hex_pre_ms_or_ms_or_keyblock));
+            g_free(hex_pre_ms_or_ms_or_keyblock);
+
+            // Create a mapping to this data from something identifiable in the
+            // stream
 
             /* Find a master key from any format (CLIENT_RANDOM, SID, ...) */
             for (i = 0; i < G_N_ELEMENTS(mk_groups); i++) {
@@ -5008,7 +5062,7 @@ ssl_load_keyfile(const gchar *ssl_keylog_filename, FILE **keylog_file,
             }
             DISSECTOR_ASSERT(ht); /* Cannot be reached, or regex is wrong. */
 
-            g_hash_table_insert(ht, key, pre_ms_or_ms);
+            g_hash_table_insert(ht, key, pre_ms_or_ms_or_keyblock);
 
         } else {
             ssl_debug_printf("    unrecognized line\n");
